@@ -7293,16 +7293,17 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
     if step == "adm_backup_pw_wait":
         _admin_import_pending.pop(chat_id, None)
         asyncio.create_task(auto_delete_msg(update.message, delay=5))
+        if not raw:
+            msg = await update.message.reply_text("Password cannot be empty.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
         if len(raw) > 150:
             msg = await update.message.reply_text(
                 "Password must be 150 characters or less. Please try again."
             )
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
-        if not raw:
-            msg = await update.message.reply_text("Password cannot be empty.")
-            asyncio.create_task(auto_delete_msg(msg, delay=60))
-            return
+        password = raw
         progress = await update.message.reply_text("⏳ Creating backup, please wait...")
         _backup_tables = [
             "users", "totp_accounts", "sessions", "reset_otps", "reset_attempts",
@@ -7311,21 +7312,34 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             "weekly_signup_counts", "vault_login_history", "totp_add_rate",
             "vault_custom_limits", "user_signup_disabled", "user_login_disabled",
             "otp_request_log", "captcha_attempts", "telegram_banned", "stats_events",
-            "vault_ei_limits", "vault_ei_usage",
+            "vault_ei_limits", "vault_ei_usage", "maintenance_whitelist",
+            "vault_signed_terms",
         ]
-        dump = {}
-        with get_db() as c:
-            for tbl in _backup_tables:
-                try:
-                    rows = c.execute(f"SELECT * FROM {tbl}").fetchall()
-                    dump[tbl] = [dict(r) for r in rows]
-                except Exception as e:
-                    logger.warning(f"Backup table {tbl}: {e}")
-        plain   = json.dumps(dump, ensure_ascii=False, default=str).encode()
-        payload = _admin_encrypt(plain, raw)
-        ts_str  = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        fname   = f"bv_backup_{ts_str}.bvadmin"
-        bio     = BytesIO(payload); bio.name = fname
+        def _build_backup():
+            dump = {}
+            with get_db() as c:
+                for tbl in _backup_tables:
+                    try:
+                        rows = c.execute(f"SELECT * FROM {tbl}").fetchall()
+                        dump[tbl] = [dict(r) for r in rows]
+                    except Exception as e:
+                        logger.warning(f"Backup table {tbl}: {e}")
+            plain = json.dumps(dump, ensure_ascii=False, default=str).encode()
+            return _admin_encrypt(plain, password)
+        try:
+            payload = await asyncio.to_thread(_build_backup)
+        except Exception as e:
+            logger.error(f"Admin backup failed: {e}")
+            try:
+                await progress.delete()
+            except Exception:
+                pass
+            msg = await update.message.reply_text("❌ Backup failed. Check logs.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        ts_str = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        fname  = f"bv_backup_{ts_str}.bvadmin"
+        bio    = BytesIO(payload); bio.name = fname
         try:
             await progress.delete()
         except Exception:
@@ -7380,28 +7394,42 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             "weekly_signup_counts", "vault_login_history", "totp_add_rate",
             "vault_custom_limits", "user_signup_disabled", "user_login_disabled",
             "otp_request_log", "captcha_attempts", "telegram_banned", "stats_events",
-            "vault_ei_limits", "vault_ei_usage",
+            "vault_ei_limits", "vault_ei_usage", "maintenance_whitelist",
+            "vault_signed_terms",
         ]
-        restored = []
-        with get_db() as c:
-            for tbl in _restore_tables:
-                if tbl not in dump:
-                    continue
-                try:
-                    c.execute(f"DELETE FROM {tbl}")
-                    rows = dump[tbl]
-                    if rows:
-                        cols = ", ".join(rows[0].keys())
-                        placeholders = ", ".join("?" for _ in rows[0])
-                        for row in rows:
-                            c.execute(
-                                f"INSERT OR REPLACE INTO {tbl} ({cols}) VALUES ({placeholders})",
-                                list(row.values()),
-                            )
-                    restored.append(tbl)
-                except Exception as e:
-                    logger.warning(f"Restore table {tbl}: {e}")
-            c.commit()
+        def _do_restore():
+            restored = []
+            with get_db() as c:
+                for tbl in _restore_tables:
+                    if tbl not in dump:
+                        continue
+                    try:
+                        c.execute(f"DELETE FROM {tbl}")
+                        rows = dump[tbl]
+                        if rows:
+                            cols         = ", ".join(rows[0].keys())
+                            placeholders = ", ".join("?" for _ in rows[0])
+                            for row in rows:
+                                c.execute(
+                                    f"INSERT OR REPLACE INTO {tbl} ({cols}) VALUES ({placeholders})",
+                                    list(row.values()),
+                                )
+                        restored.append(tbl)
+                    except Exception as e:
+                        logger.warning(f"Restore table {tbl}: {e}")
+                c.commit()
+            return restored
+        try:
+            restored = await asyncio.to_thread(_do_restore)
+        except Exception as e:
+            logger.error(f"Admin restore failed: {e}")
+            try:
+                await progress.delete()
+            except Exception:
+                pass
+            msg = await update.message.reply_text("❌ Restore failed. Check logs.")
+            asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
         _load_bot_settings()
         try:
             await progress.delete()
@@ -8528,163 +8556,6 @@ async def adm_bc_send_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Backup All: admin typed the encryption password ─────────────────
-    if step == "adm_backup_pw_wait":
-        _admin_import_pending.pop(chat_id, None)
-        asyncio.create_task(auto_delete_msg(update.message, delay=5))
-        if len(raw) > 150:
-            msg = await update.message.reply_text(
-                "Password must be 150 characters or less. Please try again."
-            )
-            asyncio.create_task(auto_delete_msg(msg, delay=60))
-            return
-        if not raw:
-            msg = await update.message.reply_text("Password cannot be empty.")
-            asyncio.create_task(auto_delete_msg(msg, delay=60))
-            return
-        progress = await update.message.reply_text("⏳ Creating backup, please wait...")
-        _backup_tables = [
-            "users",
-            "totp_accounts",
-            "sessions",
-            "reset_otps",
-            "reset_attempts",
-            "login_alerts",
-            "share_links",
-            "login_attempts",
-            "backup_reminders",
-            "bot_settings",
-            "auto_backup_settings",
-            "daily_login_counts",
-            "weekly_signup_counts",
-            "vault_login_history",
-            "totp_add_rate",
-            "vault_custom_limits",
-            "user_signup_disabled",
-            "user_login_disabled",
-            "otp_request_log",
-            "captcha_attempts",
-            "telegram_banned",
-            "stats_events",
-            "vault_ei_limits",
-            "vault_ei_usage",
-        ]
-        dump = {}
-        with get_db() as c:
-            for tbl in _backup_tables:
-                try:
-                    rows = c.execute(f"SELECT * FROM {tbl}").fetchall()
-                    dump[tbl] = [dict(r) for r in rows]
-                except Exception as e:
-                    logger.warning(f"Backup table {tbl}: {e}")
-        plain   = json.dumps(dump, ensure_ascii=False, default=str).encode()
-        payload = _admin_encrypt(plain, raw)
-        ts_str  = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        fname   = f"bv_backup_{ts_str}.bvadmin"
-        bio     = BytesIO(payload); bio.name = fname
-        try:
-            await progress.delete()
-        except Exception:
-            pass
-        await ctx.bot.send_document(
-            chat_id=chat_id, document=bio, filename=fname,
-            caption=(
-                f"💾 Full DB Backup\n"
-                f"📅 {ts_str} UTC\n"
-                f"🔑 Encrypted with your provided password.\n\n"
-                f"Use the Restore button to import."
-            ),
-        )
-        return
-
-    # ── Restore: admin sent the encrypted backup file ─────────────────────
-    if step == "adm_backup_restore_file":
-        if not update.message.document:
-            msg = await update.message.reply_text("⚠️ Please send a .bvadmin backup file.")
-            asyncio.create_task(auto_delete_msg(msg, delay=60))
-            return
-        asyncio.create_task(auto_delete_msg(update.message, delay=60))
-        bio = BytesIO()
-        f   = await update.message.document.get_file()
-        await f.download_to_memory(bio)
-        _admin_import_pending[chat_id] = {"step": "adm_backup_restore_pw", "payload": bio.getvalue()}
-        msg = await update.message.reply_text(
-            "🔒 File received. Now send the encryption password."
-        )
-        asyncio.create_task(auto_delete_msg(msg, delay=120))
-        return
-
-    # ── Restore: admin typed decryption password ──────────────────────────
-    if step == "adm_backup_restore_pw":
-        payload = state.get("payload", b"")
-        _admin_import_pending.pop(chat_id, None)
-        asyncio.create_task(auto_delete_msg(update.message, delay=5))
-        try:
-            plain = _admin_decrypt(payload, raw)
-            dump  = json.loads(plain.decode())
-        except Exception:
-            msg = await update.message.reply_text(
-                "❌ Wrong password or corrupted file. Restore cancelled."
-            )
-            asyncio.create_task(auto_delete_msg(msg, delay=60))
-            return
-        progress = await update.message.reply_text("⏳ Restoring data, please wait...")
-        _restore_tables = [
-            "users",
-            "totp_accounts",
-            "sessions",
-            "reset_otps",
-            "reset_attempts",
-            "login_alerts",
-            "share_links",
-            "login_attempts",
-            "backup_reminders",
-            "bot_settings",
-            "auto_backup_settings",
-            "daily_login_counts",
-            "weekly_signup_counts",
-            "vault_login_history",
-            "totp_add_rate",
-            "vault_custom_limits",
-            "user_signup_disabled",
-            "user_login_disabled",
-            "otp_request_log",
-            "captcha_attempts",
-            "telegram_banned",
-            "stats_events",
-            "vault_ei_limits",
-            "vault_ei_usage",
-        ]
-        restored = []
-        with get_db() as c:
-            for tbl in _restore_tables:
-                if tbl not in dump:
-                    continue
-                try:
-                    c.execute(f"DELETE FROM {tbl}")
-                    rows = dump[tbl]
-                    if rows:
-                        cols = ", ".join(rows[0].keys())
-                        placeholders = ", ".join("?" for _ in rows[0])
-                        for row in rows:
-                            c.execute(
-                                f"INSERT OR REPLACE INTO {tbl} ({cols}) VALUES ({placeholders})",
-                                list(row.values()),
-                            )
-                    restored.append(tbl)
-                except Exception as e:
-                    logger.warning(f"Restore table {tbl}: {e}")
-            c.commit()
-        _load_bot_settings()
-        try:
-            await progress.delete()
-        except Exception:
-            pass
-        await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=f"✅ Restore complete. Tables restored: {', '.join(restored)}",
-        )
-        return
-
     # ── Backup Specific User: admin typed vault id or telegram id ─────────
     if step == "adm_backup_specific_wait":
         _admin_import_pending.pop(chat_id, None)
