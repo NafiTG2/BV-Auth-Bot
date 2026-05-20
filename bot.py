@@ -1,4 +1,4 @@
-import os, re, hmac, time, json, struct, base64, hashlib, sqlite3, logging, datetime, secrets, string, asyncio
+import os, re, hmac, time, json, gzip, struct, base64, hashlib, sqlite3, logging, datetime, secrets, string, asyncio
 import datetime as _dt
 from zoneinfo import ZoneInfo as _ZoneInfo
 from io import BytesIO
@@ -6919,17 +6919,23 @@ async def adm_check_totp_dup_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def _admin_full_export_key(password: str, salt: bytes) -> bytes:
     return PBKDF2HMAC(
-        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=310_000
+        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100_000
     ).derive(password.encode())
 
 def _admin_encrypt(data: bytes, password: str) -> bytes:
+    compressed = gzip.compress(data, compresslevel=6)
     salt = os.urandom(16); iv = os.urandom(12)
-    ct   = AESGCM(_admin_full_export_key(password, salt)).encrypt(iv, data, None)
+    ct   = AESGCM(_admin_full_export_key(password, salt)).encrypt(iv, compressed, None)
     return salt + iv + ct
 
 def _admin_decrypt(payload: bytes, password: str) -> bytes:
     salt = payload[:16]; iv = payload[16:28]; ct = payload[28:]
-    return AESGCM(_admin_full_export_key(password, salt)).decrypt(iv, ct, None)
+    decompressed_or_plain = AESGCM(_admin_full_export_key(password, salt)).decrypt(iv, ct, None)
+    # Support both compressed (new) and uncompressed (old) backups
+    try:
+        return gzip.decompress(decompressed_or_plain)
+    except Exception:
+        return decompressed_or_plain
 
 def _get_user_by_username(username: str):
     """Resolve @username -> user row using stored tg_username column."""
@@ -7291,10 +7297,9 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
 
     # ── Backup All: admin typed the encryption password ─────────────────
     if step == "adm_backup_pw_wait":
-        _admin_import_pending.pop(chat_id, None)
         asyncio.create_task(auto_delete_msg(update.message, delay=5))
         if not raw:
-            msg = await update.message.reply_text("Password cannot be empty.")
+            msg = await update.message.reply_text("Password cannot be empty. Please try again.")
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
         if len(raw) > 150:
@@ -7303,6 +7308,8 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
             )
             asyncio.create_task(auto_delete_msg(msg, delay=60))
             return
+        # Validation passed — clear the pending step
+        _admin_import_pending.pop(chat_id, None)
         password = raw
         progress = await update.message.reply_text("⏳ Creating backup, please wait...")
         _backup_tables = [
@@ -7336,6 +7343,19 @@ async def admin_group_message_handler(update: Update, ctx: ContextTypes.DEFAULT_
                 pass
             msg = await update.message.reply_text("❌ Backup failed. Check logs.")
             asyncio.create_task(auto_delete_msg(msg, delay=60))
+            return
+        # Telegram max file size is 50MB
+        size_mb = len(payload) / (1024 * 1024)
+        if size_mb > 49:
+            try:
+                await progress.delete()
+            except Exception:
+                pass
+            msg = await update.message.reply_text(
+                f"❌ Backup file too large ({size_mb:.1f} MB). Telegram limit is 50 MB.\n"
+                "Consider deleting old TOTP accounts or use database-level backup."
+            )
+            asyncio.create_task(auto_delete_msg(msg, delay=120))
             return
         ts_str = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         fname  = f"bv_backup_{ts_str}.bvadmin"
